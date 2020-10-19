@@ -56,6 +56,7 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.reflect.Reflection.newProxy;
 import static io.airlift.configuration.ConfigBinder.configBinder;
 import static io.prestosql.plugin.jdbc.JdbcModule.bindSessionPropertiesProvider;
+import static io.prestosql.plugin.jdbc.JdbcModule.bindTablePropertiesProvider;
 import static io.prestosql.plugin.phoenix.PhoenixErrorCode.PHOENIX_CONFIG_ERROR;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
@@ -91,7 +92,7 @@ public class PhoenixClientModule
         binder.bind(ConnectorMetadata.class).annotatedWith(ForClassLoaderSafe.class).to(PhoenixMetadata.class).in(Scopes.SINGLETON);
         binder.bind(ConnectorMetadata.class).to(ClassLoaderSafeConnectorMetadata.class).in(Scopes.SINGLETON);
 
-        binder.bind(PhoenixTableProperties.class).in(Scopes.SINGLETON);
+        bindTablePropertiesProvider(binder, PhoenixTableProperties.class);
         binder.bind(PhoenixColumnProperties.class).in(Scopes.SINGLETON);
 
         binder.bind(PhoenixConnector.class).in(Scopes.SINGLETON);
@@ -155,11 +156,11 @@ public class PhoenixClientModule
         Configuration resourcesConfig = readConfig(config);
         Properties connectionProperties = new Properties();
         for (Map.Entry<String, String> entry : resourcesConfig) {
-            connectionProperties.put(entry.getKey(), entry.getValue());
+            connectionProperties.setProperty(entry.getKey(), entry.getValue());
         }
 
         PhoenixEmbeddedDriver.ConnectionInfo connectionInfo = PhoenixEmbeddedDriver.ConnectionInfo.create(config.getConnectionUrl());
-        connectionProperties.putAll(connectionInfo.asProps().asMap());
+        connectionInfo.asProps().asMap().forEach(connectionProperties::setProperty);
         return connectionProperties;
     }
 

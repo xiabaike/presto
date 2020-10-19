@@ -14,6 +14,7 @@
 package io.prestosql.plugin.hive.util;
 
 import com.google.common.collect.ImmutableList;
+import io.airlift.units.DataSize;
 import io.prestosql.plugin.hive.AcidInfo;
 import io.prestosql.plugin.hive.HiveColumnHandle;
 import io.prestosql.plugin.hive.HivePartitionKey;
@@ -62,6 +63,7 @@ public class InternalHiveSplitFactory
     private final TableToPartitionMapping tableToPartitionMapping;
     private final BooleanSupplier partitionMatchSupplier;
     private final Optional<BucketConversion> bucketConversion;
+    private final long minimumTargetSplitSizeInBytes;
     private final boolean forceLocalScheduling;
     private final boolean s3SelectPushdownEnabled;
 
@@ -75,6 +77,7 @@ public class InternalHiveSplitFactory
             BooleanSupplier partitionMatchSupplier,
             TableToPartitionMapping tableToPartitionMapping,
             Optional<BucketConversion> bucketConversion,
+            DataSize minimumTargetSplitSize,
             boolean forceLocalScheduling,
             boolean s3SelectPushdownEnabled)
     {
@@ -89,6 +92,8 @@ public class InternalHiveSplitFactory
         this.bucketConversion = requireNonNull(bucketConversion, "bucketConversion is null");
         this.forceLocalScheduling = forceLocalScheduling;
         this.s3SelectPushdownEnabled = s3SelectPushdownEnabled;
+        this.minimumTargetSplitSizeInBytes = requireNonNull(minimumTargetSplitSize, "minimumTargetSplitSize is null").toBytes();
+        checkArgument(minimumTargetSplitSizeInBytes > 0, "minimumTargetSplitSize must be > 0, found: %s", minimumTargetSplitSize);
     }
 
     public String getPartitionName()
@@ -98,7 +103,9 @@ public class InternalHiveSplitFactory
 
     public Optional<InternalHiveSplit> createInternalHiveSplit(LocatedFileStatus status, OptionalInt bucketNumber, boolean splittable, Optional<AcidInfo> acidInfo)
     {
-        splittable = splittable && isSplittable(inputFormat, fileSystem, status.getPath());
+        splittable = splittable &&
+                status.getLen() > minimumTargetSplitSizeInBytes &&
+                isSplittable(inputFormat, fileSystem, status.getPath());
         return createInternalHiveSplit(
                 status.getPath(),
                 status.getBlockLocations(),
@@ -132,7 +139,7 @@ public class InternalHiveSplitFactory
             BlockLocation[] blockLocations,
             long start,
             long length,
-            long fileSize,
+            long estimatedFileSize,
             long fileModificationTime,
             OptionalInt bucketNumber,
             boolean splittable,
@@ -154,7 +161,7 @@ public class InternalHiveSplitFactory
         // For empty files, some filesystem (e.g. LocalFileSystem) produce one empty block
         // while others (e.g. hdfs.DistributedFileSystem) produces no block.
         // Synthesize an empty block if one does not already exist.
-        if (fileSize == 0 && blockLocations.length == 0) {
+        if (estimatedFileSize == 0 && blockLocations.length == 0) {
             blockLocations = new BlockLocation[] {new BlockLocation()};
             // Turn off force local scheduling because hosts list doesn't exist.
             forceLocalScheduling = false;
@@ -188,7 +195,7 @@ public class InternalHiveSplitFactory
                 pathString,
                 start,
                 start + length,
-                fileSize,
+                estimatedFileSize,
                 fileModificationTime,
                 schema,
                 partitionKeys,

@@ -50,12 +50,15 @@ import static java.util.concurrent.TimeUnit.MINUTES;
         "deprecated.legacy-row-field-ordinal-access",
         "deprecated.legacy-unnest-array-rows",
         "resource-group-manager",
+        "fast-inequality-joins",
         "experimental.resource-groups-enabled",
         "experimental-syntax-enabled",
         "analyzer.experimental-syntax-enabled",
         "optimizer.processing-optimization",
         "deprecated.legacy-order-by",
-        "deprecated.legacy-join-using"})
+        "deprecated.legacy-join-using",
+        "deprecated.legacy-timestamp"
+})
 public class FeaturesConfig
 {
     @VisibleForTesting
@@ -73,7 +76,6 @@ public class FeaturesConfig
     private boolean dynamicScheduleForGroupedExecution;
     private int concurrentLifespansPerTask;
     private boolean spatialJoinsEnabled = true;
-    private boolean fastInequalityJoins = true;
     private JoinReorderingStrategy joinReorderingStrategy = JoinReorderingStrategy.AUTOMATIC;
     private int maxReorderedJoins = 9;
     private boolean redistributeWrites = true;
@@ -86,12 +88,13 @@ public class FeaturesConfig
     private boolean pushTableWriteThroughUnion = true;
     private DataIntegrityVerification exchangeDataIntegrityVerification = DataIntegrityVerification.ABORT;
     private boolean exchangeCompressionEnabled;
-    private boolean legacyTimestamp = true;
     private boolean optimizeMixedDistinctAggregations;
     private boolean unwrapCasts = true;
     private boolean forceSingleNodeOutput = true;
     private boolean pagesIndexEagerCompactionEnabled;
     private boolean distributedSort = true;
+    private boolean omitDateTimeTypePrecision;
+    private int maxRecursionDepth = 10;
 
     private boolean dictionaryAggregation;
 
@@ -125,12 +128,9 @@ public class FeaturesConfig
     private boolean skipRedundantSort = true;
     private boolean predicatePushdownUseTableProperties = true;
     private boolean ignoreDownstreamPreferences;
+    private boolean iterativeRuleBasedColumnPruning = true;
 
     private Duration iterativeOptimizerTimeout = new Duration(3, MINUTES); // by default let optimizer wait a long time in case it retrieves some data from ConnectorMetadata
-    private boolean enableDynamicFiltering = true;
-    private int dynamicFilteringMaxPerDriverRowCount = 100;
-    private DataSize dynamicFilteringMaxPerDriverSize = DataSize.of(10, KILOBYTE);
-
     private DataSize filterAndProjectMinOutputPageSize = DataSize.of(500, KILOBYTE);
     private int filterAndProjectMinOutputPageRowCount = 256;
     private int maxGroupingSets = 2048;
@@ -215,16 +215,16 @@ public class FeaturesConfig
         return this;
     }
 
-    @Config("deprecated.legacy-timestamp")
-    public FeaturesConfig setLegacyTimestamp(boolean value)
+    public boolean isOmitDateTimeTypePrecision()
     {
-        this.legacyTimestamp = value;
-        return this;
+        return omitDateTimeTypePrecision;
     }
 
-    public boolean isLegacyTimestamp()
+    @Config("deprecated.omit-datetime-type-precision")
+    public FeaturesConfig setOmitDateTimeTypePrecision(boolean value)
     {
-        return legacyTimestamp;
+        this.omitDateTimeTypePrecision = value;
+        return this;
     }
 
     public JoinDistributionType getJoinDistributionType()
@@ -318,19 +318,6 @@ public class FeaturesConfig
     {
         this.spatialJoinsEnabled = spatialJoinsEnabled;
         return this;
-    }
-
-    @Config("fast-inequality-joins")
-    @ConfigDescription("Use faster handling of inequality joins if it is possible")
-    public FeaturesConfig setFastInequalityJoins(boolean fastInequalityJoins)
-    {
-        this.fastInequalityJoins = fastInequalityJoins;
-        return this;
-    }
-
-    public boolean isFastInequalityJoins()
-    {
-        return fastInequalityJoins;
     }
 
     public JoinReorderingStrategy getJoinReorderingStrategy()
@@ -733,46 +720,6 @@ public class FeaturesConfig
         return this;
     }
 
-    public boolean isEnableDynamicFiltering()
-    {
-        return enableDynamicFiltering;
-    }
-
-    @Config("enable-dynamic-filtering")
-    @LegacyConfig("experimental.enable-dynamic-filtering")
-    public FeaturesConfig setEnableDynamicFiltering(boolean value)
-    {
-        this.enableDynamicFiltering = value;
-        return this;
-    }
-
-    public int getDynamicFilteringMaxPerDriverRowCount()
-    {
-        return dynamicFilteringMaxPerDriverRowCount;
-    }
-
-    @Config("dynamic-filtering-max-per-driver-row-count")
-    @LegacyConfig("experimental.dynamic-filtering-max-per-driver-row-count")
-    public FeaturesConfig setDynamicFilteringMaxPerDriverRowCount(int dynamicFilteringMaxPerDriverRowCount)
-    {
-        this.dynamicFilteringMaxPerDriverRowCount = dynamicFilteringMaxPerDriverRowCount;
-        return this;
-    }
-
-    @MaxDataSize("1MB")
-    public DataSize getDynamicFilteringMaxPerDriverSize()
-    {
-        return dynamicFilteringMaxPerDriverSize;
-    }
-
-    @Config("dynamic-filtering-max-per-driver-size")
-    @LegacyConfig("experimental.dynamic-filtering-max-per-driver-size")
-    public FeaturesConfig setDynamicFilteringMaxPerDriverSize(DataSize dynamicFilteringMaxPerDriverSize)
-    {
-        this.dynamicFilteringMaxPerDriverSize = dynamicFilteringMaxPerDriverSize;
-        return this;
-    }
-
     public boolean isOptimizeMixedDistinctAggregations()
     {
         return optimizeMixedDistinctAggregations;
@@ -970,6 +917,18 @@ public class FeaturesConfig
         return this;
     }
 
+    public int getMaxRecursionDepth()
+    {
+        return maxRecursionDepth;
+    }
+
+    @Config("max-recursion-depth")
+    public FeaturesConfig setMaxRecursionDepth(int maxRecursionDepth)
+    {
+        this.maxRecursionDepth = maxRecursionDepth;
+        return this;
+    }
+
     public int getMaxGroupingSets()
     {
         return maxGroupingSets;
@@ -1028,6 +987,18 @@ public class FeaturesConfig
     public FeaturesConfig setIgnoreDownstreamPreferences(boolean ignoreDownstreamPreferences)
     {
         this.ignoreDownstreamPreferences = ignoreDownstreamPreferences;
+        return this;
+    }
+
+    public boolean isIterativeRuleBasedColumnPruning()
+    {
+        return iterativeRuleBasedColumnPruning;
+    }
+
+    @Config("optimizer.iterative-rule-based-column-pruning")
+    public FeaturesConfig setIterativeRuleBasedColumnPruning(boolean iterativeRuleBasedColumnPruning)
+    {
+        this.iterativeRuleBasedColumnPruning = iterativeRuleBasedColumnPruning;
         return this;
     }
 }

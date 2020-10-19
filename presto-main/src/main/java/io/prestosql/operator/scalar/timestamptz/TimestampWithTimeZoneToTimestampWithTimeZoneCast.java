@@ -25,9 +25,9 @@ import static io.prestosql.spi.type.DateTimeEncoding.unpackMillisUtc;
 import static io.prestosql.spi.type.DateTimeEncoding.unpackZoneKey;
 import static io.prestosql.spi.type.TimestampWithTimeZoneType.MAX_PRECISION;
 import static io.prestosql.spi.type.TimestampWithTimeZoneType.MAX_SHORT_PRECISION;
-import static io.prestosql.type.Timestamps.PICOSECONDS_PER_MILLISECOND;
-import static io.prestosql.type.Timestamps.round;
-import static io.prestosql.type.Timestamps.roundToNearest;
+import static io.prestosql.type.DateTimes.PICOSECONDS_PER_MILLISECOND;
+import static io.prestosql.type.DateTimes.round;
+import static io.prestosql.type.DateTimes.roundToNearest;
 
 @ScalarOperator(CAST)
 public final class TimestampWithTimeZoneToTimestampWithTimeZoneCast
@@ -81,9 +81,15 @@ public final class TimestampWithTimeZoneToTimestampWithTimeZoneCast
             @LiteralParameter("targetPrecision") long targetPrecision,
             @SqlType("timestamp(sourcePrecision) with time zone") LongTimestampWithTimeZone timestamp)
     {
+        long epochMillis = timestamp.getEpochMillis();
+        int picosOfMilli = (int) round(timestamp.getPicosOfMilli(), (int) (MAX_PRECISION - targetPrecision));
+        if (picosOfMilli == PICOSECONDS_PER_MILLISECOND) {
+            epochMillis++;
+            picosOfMilli = 0;
+        }
         return LongTimestampWithTimeZone.fromEpochMillisAndFraction(
-                timestamp.getEpochMillis(),
-                (int) round(timestamp.getPicosOfMilli(), (int) (MAX_PRECISION - targetPrecision)),
+                epochMillis,
+                picosOfMilli,
                 timestamp.getTimeZoneKey());
     }
 }

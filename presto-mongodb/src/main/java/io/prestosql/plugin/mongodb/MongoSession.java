@@ -35,6 +35,7 @@ import io.airlift.log.Logger;
 import io.airlift.slice.Slice;
 import io.prestosql.spi.PrestoException;
 import io.prestosql.spi.connector.ColumnHandle;
+import io.prestosql.spi.connector.ColumnMetadata;
 import io.prestosql.spi.connector.SchemaNotFoundException;
 import io.prestosql.spi.connector.SchemaTableName;
 import io.prestosql.spi.connector.TableNotFoundException;
@@ -74,7 +75,7 @@ import static io.prestosql.spi.type.BigintType.BIGINT;
 import static io.prestosql.spi.type.BooleanType.BOOLEAN;
 import static io.prestosql.spi.type.DoubleType.DOUBLE;
 import static io.prestosql.spi.type.SmallintType.SMALLINT;
-import static io.prestosql.spi.type.TimestampType.TIMESTAMP;
+import static io.prestosql.spi.type.TimestampType.TIMESTAMP_MILLIS;
 import static io.prestosql.spi.type.TinyintType.TINYINT;
 import static io.prestosql.spi.type.VarcharType.createUnboundedVarcharType;
 import static java.lang.Math.toIntExact;
@@ -188,6 +189,30 @@ public class MongoSession
         getCollection(tableName).drop();
 
         tableCache.invalidate(tableName);
+    }
+
+    public void addColumn(SchemaTableName schemaTableName, ColumnMetadata columnMetadata)
+    {
+        Document metadata = getTableMetadata(schemaTableName);
+
+        List<Document> columns = new ArrayList<>(getColumnMetadata(metadata));
+
+        Document newColumn = new Document();
+        newColumn.append(FIELDS_NAME_KEY, columnMetadata.getName());
+        newColumn.append(FIELDS_TYPE_KEY, columnMetadata.getType().getTypeSignature().toString());
+        newColumn.append(FIELDS_HIDDEN_KEY, false);
+        columns.add(newColumn);
+
+        String schemaName = toRemoteSchemaName(schemaTableName.getSchemaName());
+        String tableName = toRemoteTableName(schemaName, schemaTableName.getTableName());
+
+        metadata.append(FIELDS_KEY, columns);
+
+        MongoDatabase db = client.getDatabase(schemaName);
+        MongoCollection<Document> schema = db.getCollection(schemaCollection);
+        schema.findOneAndReplace(new Document(TABLE_NAME_KEY, tableName), metadata);
+
+        tableCache.invalidate(schemaTableName);
     }
 
     private MongoTable loadTableSchema(SchemaTableName tableName)
@@ -565,7 +590,7 @@ public class MongoSession
             typeSignature = DOUBLE.getTypeSignature();
         }
         else if (value instanceof Date) {
-            typeSignature = TIMESTAMP.getTypeSignature();
+            typeSignature = TIMESTAMP_MILLIS.getTypeSignature();
         }
         else if (value instanceof ObjectId) {
             typeSignature = OBJECT_ID.getTypeSignature();
@@ -575,7 +600,7 @@ public class MongoSession
                     .map(this::guessFieldType)
                     .collect(toList());
 
-            if (subTypes.isEmpty() || subTypes.stream().anyMatch(t -> t.isEmpty())) {
+            if (subTypes.isEmpty() || subTypes.stream().anyMatch(Optional::isEmpty)) {
                 return Optional.empty();
             }
 

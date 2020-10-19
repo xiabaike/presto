@@ -10,6 +10,17 @@ Linux Operating System
 
 * 64-bit required
 * newer release preferred, especially when running on containers
+* adequate ulimits for the user that runs the Presto process. These limits
+  may depend on the specific Linux distribution you are using. The number
+  of open file descriptors needed for a particular Presto instance scales
+  as roughly the number of machines in the cluster, times some factor 
+  depending on the workload. We recommend the following limits, which can 
+  typically be set in ``/etc/security/limits.conf``:
+
+.. code-block:: none
+
+    presto soft nofile 131072
+    presto hard nofile 131072
 
 .. _requirements-java:
 
@@ -17,7 +28,8 @@ Java Runtime Environment
 ^^^^^^^^^^^^^^^^^^^^^^^^
 
 * 64-bit required
-* version 11 recommended (higher versions are less tested)
+* version 11 recommended (lower versions not supported, higher versions less
+  tested)
 * Azul Zulu recommended (most tested)
 
 Python
@@ -108,6 +120,8 @@ The following provides a good starting point for creating ``etc/jvm.config``:
     -XX:+ExitOnOutOfMemoryError
     -XX:+HeapDumpOnOutOfMemoryError
     -XX:ReservedCodeCacheSize=512M
+    -XX:PerMethodRecompilationCutoff=10000
+    -XX:PerBytecodeRecompilationCutoff=10000
     -Djdk.attach.allowAttachSelf=true
     -Djdk.nio.maxCachedBufferSize=2000000
 

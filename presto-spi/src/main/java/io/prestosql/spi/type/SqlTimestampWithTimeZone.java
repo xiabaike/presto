@@ -17,20 +17,23 @@ import com.fasterxml.jackson.annotation.JsonValue;
 
 import java.time.Instant;
 import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.Objects;
 
+import static io.prestosql.spi.type.Timestamps.MILLISECONDS_PER_SECOND;
 import static io.prestosql.spi.type.Timestamps.PICOSECONDS_PER_MILLISECOND;
 import static io.prestosql.spi.type.Timestamps.formatTimestampWithTimeZone;
 import static io.prestosql.spi.type.Timestamps.round;
+import static io.prestosql.spi.type.Timestamps.roundDiv;
+import static java.lang.Math.floorDiv;
+import static java.lang.Math.floorMod;
+import static java.lang.Math.toIntExact;
 import static java.util.Objects.requireNonNull;
 
 public final class SqlTimestampWithTimeZone
 {
     private static final int NANOSECONDS_PER_MILLISECOND = 1_000_000;
     private static final int PICOSECONDS_PER_NANOSECOND = 1_000;
-
-    // This needs to be Locale-independent, Java Time's DateTimeFormatter compatible and should never change, as it defines the external API data format.
-    public static final String JSON_FORMAT = "uuuu-MM-dd HH:mm:ss[.SSS] VV";
 
     private final int precision;
     private final long epochMillis;
@@ -66,7 +69,8 @@ public final class SqlTimestampWithTimeZone
         return new SqlTimestampWithTimeZone(precision, epochMillis, picosOfMilli, sessionTimeZoneKey);
     }
 
-    private SqlTimestampWithTimeZone(int precision, long epochMillis, int picosOfMilli, TimeZoneKey timeZoneKey)
+    // visible for testing
+    SqlTimestampWithTimeZone(int precision, long epochMillis, int picosOfMilli, TimeZoneKey timeZoneKey)
     {
         this.precision = precision;
         this.epochMillis = epochMillis;
@@ -131,5 +135,19 @@ public final class SqlTimestampWithTimeZone
     public int hashCode()
     {
         return Objects.hash(precision, epochMillis, picosOfMilli, timeZoneKey);
+    }
+
+    /**
+     * @return timestamp with time zone rounded to nanosecond precision
+     */
+    public ZonedDateTime toZonedDateTime()
+    {
+        long epochSecond = floorDiv(epochMillis, MILLISECONDS_PER_SECOND);
+        int nanosOfSecond = floorMod(epochMillis, MILLISECONDS_PER_SECOND) * NANOSECONDS_PER_MILLISECOND +
+                toIntExact(roundDiv(picosOfMilli, PICOSECONDS_PER_NANOSECOND));
+
+        // nanosOfSecond overflowing NANOSECONDS_PER_SECOND case is handled by Instant.ofEpochSecond
+        return Instant.ofEpochSecond(epochSecond, nanosOfSecond)
+                .atZone(timeZoneKey.getZoneId());
     }
 }

@@ -4,11 +4,6 @@ Date and Time Functions and Operators
 
 These functions and operators operate on :ref:`date and time data types <date-time-data-types>`.
 
-.. contents::
-    :local:
-    :backlinks: none
-    :depth: 1
-
 Date and Time Operators
 -----------------------
 
@@ -59,6 +54,7 @@ Date and Time Functions
     with ``3`` digits of subsecond precision,
 
 .. data:: current_timestamp(p)
+    :noindex:
 
     Returns the current :ref:`timestamp with time zone
     <timestamp-with-time-zone-data-type>` as of the start of the query, with
@@ -95,6 +91,21 @@ Date and Time Functions
         SELECT from_iso8601_timestamp('2020-05-11T11:15:05.055+01:00');
         -- 2020-05-11 11:15:05.055 +01:00
 
+.. function:: from_iso8601_timestamp_nanos(string) -> timestamp(9) with time zone
+
+    Parses the ISO 8601 formatted date ``string``, optionally with time and time
+    zone, into a ``timestamp(9) with time zone``. The time defaults to
+    ``00:00:00.000000000``, and the time zone defaults to the session time zone::
+
+        SELECT from_iso8601_timestamp('2020-05-11');
+        -- 2020-05-11 00:00:00.000000000 America/Vancouver
+
+        SELECT from_iso8601_timestamp('2020-05-11T11:15:05');
+        -- 2020-05-11 11:15:05.000000000 America/Vancouver
+
+        SELECT from_iso8601_timestamp('2020-05-11T11:15:05.123456789+01:00');
+        -- 2020-05-11 11:15:05.123456789 +01:00
+
 .. function:: from_iso8601_date(string) -> date
 
     Parses the ISO 8601 formatted date ``string`` into a ``date``. The date can
@@ -126,16 +137,23 @@ Date and Time Functions
     number of seconds since ``1970-01-01 00:00:00 UTC``.
 
 .. function:: from_unixtime(unixtime, zone) -> timestamp(3) with time zone
+    :noindex:
 
     Returns the UNIX timestamp ``unixtime`` as a timestamp with time zone
     using ``zone`` for the time zone. ``unixtime`` is the number of seconds
     since ``1970-01-01 00:00:00 UTC``.
 
 .. function:: from_unixtime(unixtime, hours, minutes) -> timestamp(3) with time zone
+    :noindex:
 
     Returns the UNIX timestamp ``unixtime`` as a timestamp with time zone
     using ``hours`` and ``minutes`` for the time zone offset. ``unixtime`` is
     the number of seconds since ``1970-01-01 00:00:00`` in ``double`` data type.
+
+.. function:: from_unixtime_nanos(unixtime) -> timestamp(9)
+
+    Returns the UNIX timestamp ``unixtime`` as a timestamp. ``unixtime`` is the
+    number of nanoseconds since ``1970-01-01 00:00:00.000000000 UTC``.
 
 .. data:: localtime
 
@@ -147,6 +165,7 @@ Date and Time Functions
     digits of subsecond precision.
 
 .. data:: localtimestamp(p)
+    :noindex:
 
     Returns the current :ref:`timestamp <timestamp-data-type>` as of the start
     of the query, with ``p`` digits of subsecond precision::
@@ -288,6 +307,16 @@ Unit    Description
         SELECT parse_duration('5m');
         -- 0 00:05:00.000
 
+.. function:: human_readable_seconds(double) -> varchar
+
+    Returns ``seconds`` expressed in terms of ``human readable interval``::
+
+        SELECT human_readable_seconds(56363463);
+        -- 93 weeks, 1 day, 8 hours, 31 minutes, 3 seconds
+
+        SELECT human_readable_seconds(61);
+        -- 1 minute, 1 second
+
 MySQL Date Functions
 --------------------
 
@@ -315,10 +344,10 @@ Specifier Description
 ``%M``    Month name (``January`` .. ``December``)
 ``%m``    Month, numeric (``01`` .. ``12``) [#z]_
 ``%p``    ``AM`` or ``PM``
-``%r``    Time, 12-hour (``hh:mm:ss`` followed by ``AM`` or ``PM``)
+``%r``    Time of day, 12-hour (equivalent to ``%h:%i:%s %p``)
 ``%S``    Seconds (``00`` .. ``59``)
 ``%s``    Seconds (``00`` .. ``59``)
-``%T``    Time, 24-hour (``hh:mm:ss``)
+``%T``    Time of day, 24-hour (equivalent to ``%H:%i:%s``)
 ``%U``    Week (``00`` .. ``53``), where Sunday is the first day of the week
 ``%u``    Week (``00`` .. ``53``), where Monday is the first day of the week
 ``%V``    Week (``01`` .. ``53``), where Sunday is the first day of the week; used with ``%X``

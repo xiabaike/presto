@@ -14,20 +14,18 @@
 package io.prestosql.testing;
 
 import io.prestosql.Session;
-import io.prestosql.cost.PlanNodeStatsEstimate;
-import io.prestosql.execution.warnings.WarningCollector;
-import io.prestosql.sql.planner.Plan;
-import io.prestosql.sql.planner.assertions.PlanMatchPattern;
-import io.prestosql.sql.planner.plan.TableScanNode;
+import io.prestosql.sql.analyzer.FeaturesConfig.JoinDistributionType;
 import org.intellij.lang.annotations.Language;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
+
+import java.util.stream.Stream;
 
 import static io.prestosql.SystemSessionProperties.IGNORE_STATS_CALCULATOR_FAILURES;
 import static io.prestosql.spi.type.VarcharType.VARCHAR;
-import static io.prestosql.sql.planner.assertions.PlanAssert.assertPlan;
+import static io.prestosql.testing.DataProviders.toDataProvider;
 import static io.prestosql.testing.QueryAssertions.assertContains;
 import static io.prestosql.testing.assertions.Assert.assertEquals;
-import static io.prestosql.transaction.TransactionBuilder.transaction;
 import static java.lang.String.format;
 import static java.lang.String.join;
 import static java.util.Collections.nCopies;
@@ -204,6 +202,28 @@ public abstract class AbstractTestIntegrationSmokeTest
     }
 
     /**
+     * Test interactions between optimizer (including CBO), scheduling and connector metadata APIs.
+     */
+    @Test(timeOut = 300_000, dataProvider = "joinDistributionTypes")
+    public void testJoinWithEmptySides(JoinDistributionType joinDistributionType)
+    {
+        Session session = noJoinReordering(joinDistributionType);
+        // empty build side
+        assertQuery(session, "SELECT count(*) FROM nation JOIN region ON nation.regionkey = region.regionkey AND region.name = ''", "VALUES 0");
+        assertQuery(session, "SELECT count(*) FROM nation JOIN region ON nation.regionkey = region.regionkey AND region.regionkey < 0", "VALUES 0");
+        // empty probe side
+        assertQuery(session, "SELECT count(*) FROM region JOIN nation ON nation.regionkey = region.regionkey AND region.name = ''", "VALUES 0");
+        assertQuery(session, "SELECT count(*) FROM nation JOIN region ON nation.regionkey = region.regionkey AND region.regionkey < 0", "VALUES 0");
+    }
+
+    @DataProvider
+    public Object[][] joinDistributionTypes()
+    {
+        return Stream.of(JoinDistributionType.values())
+                .collect(toDataProvider());
+    }
+
+    /**
      * Test interactions between optimizer (including CBO) and connector metadata APIs.
      */
     @Test
@@ -376,6 +396,19 @@ public abstract class AbstractTestIntegrationSmokeTest
                         "WHERE table_catalog = '" + catalog + "' AND table_schema LIKE '" + schema + "' AND table_name LIKE '%orders'",
                 "VALUES 'orders'");
         assertQuery("SELECT table_name FROM information_schema.tables WHERE table_catalog = 'something_else'", "SELECT '' WHERE false");
+
+        assertQuery(
+                "SELECT DISTINCT table_name FROM information_schema.tables WHERE table_schema = 'information_schema' OR rand() = 42 ORDER BY 1",
+                "VALUES " +
+                        "('applicable_roles'), " +
+                        "('columns'), " +
+                        "('enabled_roles'), " +
+                        "('role_authorization_descriptors'), " +
+                        "('roles'), " +
+                        "('schemata'), " +
+                        "('table_privileges'), " +
+                        "('tables'), " +
+                        "('views')");
     }
 
     @Test
@@ -413,28 +446,18 @@ public abstract class AbstractTestIntegrationSmokeTest
         assertQuery("SELECT table_name, column_name FROM information_schema.columns WHERE table_catalog = '" + catalog + "' AND table_schema = '" + schema + "' AND table_name LIKE '_rders'", ordersTableWithColumns);
         assertQuerySucceeds("SELECT * FROM information_schema.columns WHERE table_catalog = '" + catalog + "' AND table_name LIKE '%'");
         assertQuery("SELECT column_name FROM information_schema.columns WHERE table_catalog = 'something_else'", "SELECT '' WHERE false");
-    }
 
-    protected void assertPushedDown(String sql)
-    {
-        assertPushedDown(sql, sql);
-    }
-
-    protected void assertPushedDown(String actual, String expectedOnH2)
-    {
-        assertQuery(actual, expectedOnH2);
-
-        transaction(getQueryRunner().getTransactionManager(), getQueryRunner().getAccessControl())
-                .execute(getSession(), session -> {
-                    Plan plan = getQueryRunner().createPlan(session, actual, WarningCollector.NOOP);
-                    assertPlan(
-                            session,
-                            getQueryRunner().getMetadata(),
-                            (node, sourceStats, lookup, ignore, types) -> PlanNodeStatsEstimate.unknown(),
-                            plan,
-                            PlanMatchPattern.output(
-                                    PlanMatchPattern.exchange(
-                                            PlanMatchPattern.node(TableScanNode.class))));
-                });
+        assertQuery(
+                "SELECT DISTINCT table_name FROM information_schema.columns WHERE table_schema = 'information_schema' OR rand() = 42 ORDER BY 1",
+                "VALUES " +
+                        "('applicable_roles'), " +
+                        "('columns'), " +
+                        "('enabled_roles'), " +
+                        "('role_authorization_descriptors'), " +
+                        "('roles'), " +
+                        "('schemata'), " +
+                        "('table_privileges'), " +
+                        "('tables'), " +
+                        "('views')");
     }
 }

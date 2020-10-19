@@ -18,9 +18,11 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.SettableFuture;
 import io.prestosql.client.NodeVersion;
 import io.prestosql.cost.StatsAndCosts;
+import io.prestosql.execution.MockRemoteTaskFactory.MockRemoteTask;
 import io.prestosql.execution.scheduler.SplitSchedulerStats;
 import io.prestosql.failuredetector.NoOpFailureDetector;
 import io.prestosql.metadata.InternalNode;
+import io.prestosql.server.DynamicFilterService;
 import io.prestosql.spi.QueryId;
 import io.prestosql.spi.type.Type;
 import io.prestosql.sql.planner.Partitioning;
@@ -69,8 +71,8 @@ public class TestSqlStageExecution
     @BeforeClass
     public void setUp()
     {
-        executor = newCachedThreadPool(daemonThreadsNamed("test-executor-%s"));
-        scheduledExecutor = newScheduledThreadPool(2, daemonThreadsNamed("test-scheduledExecutor-%s"));
+        executor = newCachedThreadPool(daemonThreadsNamed(getClass().getSimpleName() + "-%s"));
+        scheduledExecutor = newScheduledThreadPool(2, daemonThreadsNamed(getClass().getSimpleName() + "-scheduledExecutor-%s"));
     }
 
     @AfterClass(alwaysRun = true)
@@ -109,6 +111,7 @@ public class TestSqlStageExecution
                 nodeTaskMap,
                 executor,
                 new NoOpFailureDetector(),
+                new DynamicFilterService(new DynamicFilterConfig()),
                 new SplitSchedulerStats());
         stage.setOutputBuffers(createInitialEmptyOutputBuffers(ARBITRARY));
 
@@ -153,6 +156,43 @@ public class TestSqlStageExecution
 
         // cancel the background thread adding tasks
         addTasksTask.cancel(true);
+    }
+
+    @Test
+    public void testIsAnyTaskBlocked()
+    {
+        NodeTaskMap nodeTaskMap = new NodeTaskMap(new FinalizerService());
+
+        StageId stageId = new StageId(new QueryId("query"), 0);
+        SqlStageExecution stage = createSqlStageExecution(
+                stageId,
+                createExchangePlanFragment(),
+                ImmutableMap.of(),
+                new MockRemoteTaskFactory(executor, scheduledExecutor),
+                TEST_SESSION,
+                true,
+                nodeTaskMap,
+                executor,
+                new NoOpFailureDetector(),
+                new DynamicFilterService(new DynamicFilterConfig()),
+                new SplitSchedulerStats());
+        stage.setOutputBuffers(createInitialEmptyOutputBuffers(ARBITRARY));
+
+        InternalNode node1 = new InternalNode("other1", URI.create("http://127.0.0.1:11"), NodeVersion.UNKNOWN, false);
+        InternalNode node2 = new InternalNode("other2", URI.create("http://127.0.0.2:12"), NodeVersion.UNKNOWN, false);
+        MockRemoteTask task1 = (MockRemoteTask) stage.scheduleTask(node1, 1, OptionalInt.empty()).get();
+        MockRemoteTask task2 = (MockRemoteTask) stage.scheduleTask(node2, 2, OptionalInt.empty()).get();
+
+        // both tasks' buffers are under utilized
+        assertFalse(stage.isAnyTaskBlocked());
+
+        // set one of the task's buffer to be over utilized
+        task1.setOutputBufferOverUtilized(true);
+        assertTrue(stage.isAnyTaskBlocked());
+
+        // set both the tasks' buffers to be over utilized
+        task2.setOutputBufferOverUtilized(true);
+        assertTrue(stage.isAnyTaskBlocked());
     }
 
     private static PlanFragment createExchangePlanFragment()

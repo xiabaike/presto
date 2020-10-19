@@ -27,6 +27,7 @@ public final class JdbcClientStats
     private final JdbcApiStats commitCreateTable = new JdbcApiStats();
     private final JdbcApiStats createSchema = new JdbcApiStats();
     private final JdbcApiStats createTable = new JdbcApiStats();
+    private final JdbcApiStats setColumnComment = new JdbcApiStats();
     private final JdbcApiStats dropColumn = new JdbcApiStats();
     private final JdbcApiStats dropSchema = new JdbcApiStats();
     private final JdbcApiStats dropTable = new JdbcApiStats();
@@ -45,6 +46,7 @@ public final class JdbcClientStats
     private final JdbcApiStats rollbackCreateTable = new JdbcApiStats();
     private final JdbcApiStats schemaExists = new JdbcApiStats();
     private final JdbcApiStats toPrestoType = new JdbcApiStats();
+    private final JdbcApiStats getColumnMappings = new JdbcApiStats();
     private final JdbcApiStats toWriteMapping = new JdbcApiStats();
     private final JdbcApiStats implementAggregation = new JdbcApiStats();
 
@@ -109,6 +111,13 @@ public final class JdbcClientStats
     public JdbcApiStats getCreateTable()
     {
         return createTable;
+    }
+
+    @Managed
+    @Nested
+    public JdbcApiStats getSetColumnComment()
+    {
+        return setColumnComment;
     }
 
     @Managed
@@ -235,6 +244,13 @@ public final class JdbcClientStats
     public JdbcApiStats getToPrestoType()
     {
         return toPrestoType;
+    }
+
+    @Managed
+    @Nested
+    public JdbcApiStats getGetColumnMappings()
+    {
+        return getColumnMappings;
     }
 
     @Managed

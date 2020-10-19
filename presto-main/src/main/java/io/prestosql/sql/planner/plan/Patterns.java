@@ -62,6 +62,11 @@ public final class Patterns
         return typeOf(ExchangeNode.class);
     }
 
+    public static Pattern<ExplainAnalyzeNode> explainAnalyze()
+    {
+        return typeOf(ExplainAnalyzeNode.class);
+    }
+
     public static Pattern<EnforceSingleRowNode> enforceSingleRow()
     {
         return typeOf(EnforceSingleRowNode.class);
@@ -220,7 +225,7 @@ public final class Patterns
         return property(
                 "sources",
                 (PlanNode node, Lookup lookup) -> node.getSources().stream()
-                        .map(source -> lookup.resolve(source))
+                        .map(lookup::resolve)
                         .collect(toImmutableList()));
     }
 

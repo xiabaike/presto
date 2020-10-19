@@ -19,13 +19,15 @@ import com.google.inject.Module;
 import com.google.inject.Provides;
 import com.google.inject.Scopes;
 import com.google.inject.multibindings.MapBinder;
-import com.google.inject.util.Modules;
 import io.airlift.configuration.AbstractConfigurationAwareModule;
 import io.airlift.discovery.server.DynamicAnnouncementResource;
 import io.airlift.discovery.server.ServiceResource;
 import io.airlift.discovery.store.StoreResource;
+import io.airlift.http.server.HttpServer.ClientCertificate;
 import io.airlift.http.server.HttpServerConfig;
 import io.airlift.jmx.MBeanResource;
+import io.prestosql.server.security.jwt.JwtAuthenticator;
+import io.prestosql.server.security.jwt.JwtAuthenticatorSupportModule;
 
 import java.util.List;
 import java.util.Map;
@@ -33,8 +35,11 @@ import java.util.Map;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.inject.multibindings.MapBinder.newMapBinder;
+import static com.google.inject.multibindings.OptionalBinder.newOptionalBinder;
 import static io.airlift.configuration.ConditionalModule.installModuleIf;
 import static io.airlift.configuration.ConfigBinder.configBinder;
+import static io.airlift.configuration.ConfigurationAwareModule.combine;
+import static io.airlift.http.server.HttpServer.ClientCertificate.REQUESTED;
 import static io.airlift.jaxrs.JaxrsBinder.jaxrsBinder;
 import static io.prestosql.server.security.ResourceSecurityBinder.resourceSecurityBinder;
 import static java.util.Locale.ENGLISH;
@@ -61,11 +66,16 @@ public class ServerSecurityModule
 
         authenticatorBinder(binder); // create empty map binder
 
-        installAuthenticator("certificate", CertificateAuthenticator.class, CertificateConfig.class);
+        install(authenticatorModule("certificate", CertificateAuthenticator.class, certificateBinder -> {
+            newOptionalBinder(certificateBinder, ClientCertificate.class).setBinding().toInstance(REQUESTED);
+            configBinder(certificateBinder).bindConfig(CertificateConfig.class);
+        }));
         installAuthenticator("kerberos", KerberosAuthenticator.class, KerberosConfig.class);
         installAuthenticator("password", PasswordAuthenticator.class, PasswordAuthenticatorConfig.class);
-        installAuthenticator("jwt", JsonWebTokenAuthenticator.class, JsonWebTokenConfig.class);
+        install(authenticatorModule("jwt", JwtAuthenticator.class, new JwtAuthenticatorSupportModule()));
 
+        configBinder(binder).bindConfig(InsecureAuthenticatorConfig.class);
+        binder.bind(InsecureAuthenticator.class).in(Scopes.SINGLETON);
         install(authenticatorModule("insecure", InsecureAuthenticator.class, unused -> {}));
     }
 
@@ -90,7 +100,7 @@ public class ServerSecurityModule
         return installModuleIf(
                 SecurityConfig.class,
                 config -> authenticationTypes(config).contains(name),
-                Modules.combine(module, authModule));
+                combine(module, authModule));
     }
 
     private void installAuthenticator(String name, Class<? extends Authenticator> authenticator, Class<?> config)

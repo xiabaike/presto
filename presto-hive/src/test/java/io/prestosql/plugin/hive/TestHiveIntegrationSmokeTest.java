@@ -20,6 +20,7 @@ import com.google.common.io.Files;
 import io.airlift.json.JsonCodec;
 import io.airlift.json.JsonCodecFactory;
 import io.airlift.json.ObjectMapperProvider;
+import io.airlift.units.Duration;
 import io.prestosql.Session;
 import io.prestosql.cost.StatsAndCosts;
 import io.prestosql.execution.QueryInfo;
@@ -53,9 +54,12 @@ import io.prestosql.testing.MaterializedResult;
 import io.prestosql.testing.MaterializedRow;
 import io.prestosql.testing.QueryRunner;
 import io.prestosql.testing.ResultWithQueryId;
+import io.prestosql.testing.sql.SqlExecutor;
+import io.prestosql.testing.sql.TestTable;
 import io.prestosql.type.TypeDeserializer;
 import org.apache.hadoop.fs.Path;
 import org.intellij.lang.annotations.Language;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 import java.io.File;
@@ -104,6 +108,7 @@ import static io.prestosql.plugin.hive.HiveTableProperties.BUCKET_COUNT_PROPERTY
 import static io.prestosql.plugin.hive.HiveTableProperties.PARTITIONED_BY_PROPERTY;
 import static io.prestosql.plugin.hive.HiveTableProperties.STORAGE_FORMAT_PROPERTY;
 import static io.prestosql.plugin.hive.HiveTestUtils.TYPE_MANAGER;
+import static io.prestosql.plugin.hive.HiveType.toHiveType;
 import static io.prestosql.plugin.hive.util.HiveUtil.columnExtraInfo;
 import static io.prestosql.spi.predicate.Marker.Bound.ABOVE;
 import static io.prestosql.spi.predicate.Marker.Bound.EXACTLY;
@@ -129,6 +134,8 @@ import static io.prestosql.testing.TestingAccessControlManager.TestingPrivilegeT
 import static io.prestosql.testing.TestingAccessControlManager.privilege;
 import static io.prestosql.testing.TestingSession.testSessionBuilder;
 import static io.prestosql.testing.assertions.Assert.assertEquals;
+import static io.prestosql.testing.assertions.Assert.assertEventually;
+import static io.prestosql.testing.sql.TestTable.randomTableSuffix;
 import static io.prestosql.tpch.TpchTable.CUSTOMER;
 import static io.prestosql.tpch.TpchTable.NATION;
 import static io.prestosql.tpch.TpchTable.ORDERS;
@@ -138,6 +145,8 @@ import static java.lang.String.format;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static java.util.stream.Collectors.joining;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -154,13 +163,11 @@ public class TestHiveIntegrationSmokeTest
 {
     private final String catalog;
     private final Session bucketedSession;
-    private final TypeTranslator typeTranslator;
 
     public TestHiveIntegrationSmokeTest()
     {
         this.catalog = HIVE_CATALOG;
         this.bucketedSession = createBucketedSession(Optional.of(new SelectedRole(ROLE, Optional.of("admin"))));
-        this.typeTranslator = new HiveTypeTranslator();
     }
 
     @Override
@@ -168,7 +175,10 @@ public class TestHiveIntegrationSmokeTest
             throws Exception
     {
         return HiveQueryRunner.builder()
-                .setHiveProperties(ImmutableMap.of("hive.allow-register-partition-procedure", "true"))
+                .setHiveProperties(ImmutableMap.of(
+                        "hive.allow-register-partition-procedure", "true",
+                        // Reduce writer sort buffer size to ensure SortingFileWriter gets used
+                        "hive.writer-sort-buffer-size", "1MB"))
                 .setInitialTables(ImmutableList.of(CUSTOMER, NATION, ORDERS, REGION))
                 .build();
     }
@@ -1175,7 +1185,7 @@ public class TestHiveIntegrationSmokeTest
         data.put("1.2345678901234578E14", new TypeAndEstimate(DOUBLE, new EstimatedStatsAndCost(1.0, 17.0, 17.0, 0.0, 0.0)));
         data.put("123456789012345678901234.567", new TypeAndEstimate(createDecimalType(30, 3), new EstimatedStatsAndCost(1.0, 25.0, 25.0, 0.0, 0.0)));
         data.put("2019-01-01", new TypeAndEstimate(DateType.DATE, new EstimatedStatsAndCost(1.0, 13.0, 13.0, 0.0, 0.0)));
-        data.put("2019-01-01 23:22:21.123", new TypeAndEstimate(TimestampType.TIMESTAMP, new EstimatedStatsAndCost(1.0, 17.0, 17.0, 0.0, 0.0)));
+        data.put("2019-01-01 23:22:21.123", new TypeAndEstimate(TimestampType.TIMESTAMP_MILLIS, new EstimatedStatsAndCost(1.0, 17.0, 17.0, 0.0, 0.0)));
         int index = 0;
         for (Map.Entry<Object, TypeAndEstimate> entry : data.entrySet()) {
             index++;
@@ -1591,8 +1601,8 @@ public class TestHiveIntegrationSmokeTest
     @Test
     public void testCreateTableWithUnsupportedType()
     {
-        assertQueryFails("CREATE TABLE test_create_table_with_unsupported_type(x time)", "Unsupported Hive type: time");
-        assertQueryFails("CREATE TABLE test_create_table_with_unsupported_type AS SELECT TIME '00:00:00' x", "Unsupported Hive type: time");
+        assertQueryFails("CREATE TABLE test_create_table_with_unsupported_type(x time)", "\\QUnsupported Hive type: time(3)\\E");
+        assertQueryFails("CREATE TABLE test_create_table_with_unsupported_type AS SELECT TIME '00:00:00' x", "\\QUnsupported Hive type: time(0)\\E");
     }
 
     @Test
@@ -1786,6 +1796,34 @@ public class TestHiveIntegrationSmokeTest
 
         assertUpdate(session, "DROP TABLE " + tableName);
         assertFalse(getQueryRunner().tableExists(session, tableName));
+    }
+
+    /**
+     * Regression test for https://github.com/prestosql/presto/issues/5295
+     */
+    @Test
+    public void testBucketedTableWithTimestampColumn()
+    {
+        String tableName = "test_bucketed_table_with_timestamp_" + randomTableSuffix();
+
+        String createTable = "" +
+                "CREATE TABLE " + tableName + " (" +
+                "  bucket_key integer, " +
+                "  a_timestamp timestamp(3) " +
+                ")" +
+                "WITH (" +
+                "  bucketed_by = ARRAY[ 'bucket_key' ], " +
+                "  bucket_count = 11 " +
+                ") ";
+        assertUpdate(createTable);
+
+        assertQuery(
+                "DESCRIBE " + tableName,
+                "VALUES " +
+                        "('bucket_key', 'integer', '', ''), " +
+                        "('a_timestamp', 'timestamp(3)', '', '')");
+
+        assertUpdate("DROP TABLE " + tableName);
     }
 
     @Test
@@ -2967,52 +3005,69 @@ public class TestHiveIntegrationSmokeTest
         assertQuery("SELECT col[1][2] FROM tmp_array13", "SELECT 2.345");
     }
 
-    @Test
-    public void testTemporalArrays()
+    @Test(dataProvider = "timestampPrecision")
+    public void testTemporalArrays(HiveTimestampPrecision timestampPrecision)
     {
+        Session session = withTimestampPrecision(getSession(), timestampPrecision.name());
+        assertUpdate("DROP TABLE IF EXISTS tmp_array11");
         assertUpdate("CREATE TABLE tmp_array11 AS SELECT ARRAY[DATE '2014-09-30'] AS col", 1);
         assertOneNotNullResult("SELECT col[1] FROM tmp_array11");
+        assertUpdate("DROP TABLE IF EXISTS tmp_array12");
         assertUpdate("CREATE TABLE tmp_array12 AS SELECT ARRAY[TIMESTAMP '2001-08-22 03:04:05.321'] AS col", 1);
-        assertOneNotNullResult("SELECT col[1] FROM tmp_array12");
+        assertOneNotNullResult(session, "SELECT col[1] FROM tmp_array12");
     }
 
-    @Test
-    public void testMaps()
+    @Test(dataProvider = "timestampPrecision")
+    public void testMaps(HiveTimestampPrecision timestampPrecision)
     {
+        Session session = withTimestampPrecision(getSession(), timestampPrecision.name());
+        assertUpdate("DROP TABLE IF EXISTS tmp_map1");
         assertUpdate("CREATE TABLE tmp_map1 AS SELECT MAP(ARRAY[0,1], ARRAY[2,NULL]) AS col", 1);
         assertQuery("SELECT col[0] FROM tmp_map1", "SELECT 2");
         assertQuery("SELECT col[1] FROM tmp_map1", "SELECT NULL");
 
+        assertUpdate("DROP TABLE IF EXISTS tmp_map2");
         assertUpdate("CREATE TABLE tmp_map2 AS SELECT MAP(ARRAY[INTEGER'1'], ARRAY[INTEGER'2']) AS col", 1);
         assertQuery("SELECT col[INTEGER'1'] FROM tmp_map2", "SELECT 2");
 
+        assertUpdate("DROP TABLE IF EXISTS tmp_map3");
         assertUpdate("CREATE TABLE tmp_map3 AS SELECT MAP(ARRAY[SMALLINT'1'], ARRAY[SMALLINT'2']) AS col", 1);
         assertQuery("SELECT col[SMALLINT'1'] FROM tmp_map3", "SELECT 2");
 
+        assertUpdate("DROP TABLE IF EXISTS tmp_map4");
         assertUpdate("CREATE TABLE tmp_map4 AS SELECT MAP(ARRAY[TINYINT'1'], ARRAY[TINYINT'2']) AS col", 1);
         assertQuery("SELECT col[TINYINT'1'] FROM tmp_map4", "SELECT 2");
 
+        assertUpdate("DROP TABLE IF EXISTS tmp_map5");
         assertUpdate("CREATE TABLE tmp_map5 AS SELECT MAP(ARRAY[1.0], ARRAY[2.5]) AS col", 1);
         assertQuery("SELECT col[1.0] FROM tmp_map5", "SELECT 2.5");
 
+        assertUpdate("DROP TABLE IF EXISTS tmp_map6");
         assertUpdate("CREATE TABLE tmp_map6 AS SELECT MAP(ARRAY['puppies'], ARRAY['kittens']) AS col", 1);
         assertQuery("SELECT col['puppies'] FROM tmp_map6", "SELECT 'kittens'");
 
+        assertUpdate("DROP TABLE IF EXISTS tmp_map7");
         assertUpdate("CREATE TABLE tmp_map7 AS SELECT MAP(ARRAY[TRUE], ARRAY[FALSE]) AS col", 1);
         assertQuery("SELECT col[TRUE] FROM tmp_map7", "SELECT FALSE");
 
+        assertUpdate("DROP TABLE IF EXISTS tmp_map8");
         assertUpdate("CREATE TABLE tmp_map8 AS SELECT MAP(ARRAY[DATE '2014-09-30'], ARRAY[DATE '2014-09-29']) AS col", 1);
         assertOneNotNullResult("SELECT col[DATE '2014-09-30'] FROM tmp_map8");
-        assertUpdate("CREATE TABLE tmp_map9 AS SELECT MAP(ARRAY[TIMESTAMP '2001-08-22 03:04:05.321'], ARRAY[TIMESTAMP '2001-08-22 03:04:05.321']) AS col", 1);
-        assertOneNotNullResult("SELECT col[TIMESTAMP '2001-08-22 03:04:05.321'] FROM tmp_map9");
 
+        assertUpdate("DROP TABLE IF EXISTS tmp_map9");
+        assertUpdate("CREATE TABLE tmp_map9 AS SELECT MAP(ARRAY[TIMESTAMP '2001-08-22 03:04:05.321'], ARRAY[TIMESTAMP '2001-08-22 03:04:05.321']) AS col", 1);
+        assertOneNotNullResult(session, "SELECT col[TIMESTAMP '2001-08-22 03:04:05.321'] FROM tmp_map9");
+
+        assertUpdate("DROP TABLE IF EXISTS tmp_map10");
         assertUpdate("CREATE TABLE tmp_map10 AS SELECT MAP(ARRAY[DECIMAL '3.14', DECIMAL '12345678901234567890.0123456789'], " +
                 "ARRAY[DECIMAL '12345678901234567890.0123456789', DECIMAL '3.0123456789']) AS col", 1);
         assertQuery("SELECT col[DECIMAL '3.14'], col[DECIMAL '12345678901234567890.0123456789'] FROM tmp_map10", "SELECT 12345678901234567890.0123456789, 3.0123456789");
 
+        assertUpdate("DROP TABLE IF EXISTS tmp_map11");
         assertUpdate("CREATE TABLE tmp_map11 AS SELECT MAP(ARRAY[REAL'1.234'], ARRAY[REAL'2.345']) AS col", 1);
         assertQuery("SELECT col[REAL'1.234'] FROM tmp_map11", "SELECT 2.345");
 
+        assertUpdate("DROP TABLE IF EXISTS tmp_map12");
         assertUpdate("CREATE TABLE tmp_map12 AS SELECT MAP(ARRAY[1.0E0], ARRAY[ARRAY[1, 2]]) AS col", 1);
         assertQuery("SELECT col[1.0][2] FROM tmp_map12", "SELECT 2");
     }
@@ -3255,7 +3310,8 @@ public class TestHiveIntegrationSmokeTest
                         "   orc_bloom_filter_columns = ARRAY['c1','c2'],\n" +
                         "   orc_bloom_filter_fpp = 7E-1,\n" +
                         "   partitioned_by = ARRAY['c5'],\n" +
-                        "   sorted_by = ARRAY['c1','c 2 DESC']\n" +
+                        "   sorted_by = ARRAY['c1','c 2 DESC'],\n" +
+                        "   transactional = true\n" +
                         ")",
                 getSession().getCatalog().get(),
                 getSession().getSchema().get(),
@@ -4112,27 +4168,54 @@ public class TestHiveIntegrationSmokeTest
         }
     }
 
-    @Test
-    public void testParquetTimestampPredicatePushdown()
+    @DataProvider
+    public Object[][] timestampPrecisionAndValues()
     {
+        // TODO: revisit values once we handle write path and are able to write with higher precision,
+        //  make sure push-down happens correctly in the presence of rounding;
+        // consider using LocalDateTime instead of String
+        return new Object[][] {
+                {HiveTimestampPrecision.MILLISECONDS, "1965-10-31 01:00:08.123"},
+                {HiveTimestampPrecision.MICROSECONDS, "1965-10-31 01:00:08.123000"},
+                {HiveTimestampPrecision.NANOSECONDS, "1965-10-31 01:00:08.123000000"},
+                {HiveTimestampPrecision.MILLISECONDS, "2012-10-31 01:00:08.123"},
+                {HiveTimestampPrecision.MICROSECONDS, "2012-10-31 01:00:08.123000"},
+                {HiveTimestampPrecision.NANOSECONDS, "2012-10-31 01:00:08.123000000"}};
+    }
+
+    @Test(dataProvider = "timestampPrecisionAndValues")
+    public void testParquetTimestampPredicatePushdown(HiveTimestampPrecision timestampPrecision, String value)
+    {
+        Session session = withTimestampPrecision(getSession(), timestampPrecision.name());
+        assertUpdate("DROP TABLE IF EXISTS test_parquet_timestamp_predicate_pushdown");
         assertUpdate("CREATE TABLE test_parquet_timestamp_predicate_pushdown (t TIMESTAMP) WITH (format = 'PARQUET')");
-        assertUpdate("INSERT INTO test_parquet_timestamp_predicate_pushdown VALUES (TIMESTAMP '2012-10-31 01:00')", 1);
+        assertUpdate(format("INSERT INTO test_parquet_timestamp_predicate_pushdown VALUES (TIMESTAMP '%s')", value), 1);
+        assertQuery(session, "SELECT * FROM test_parquet_timestamp_predicate_pushdown", format("VALUES (TIMESTAMP '%s')", value));
 
         DistributedQueryRunner queryRunner = (DistributedQueryRunner) getQueryRunner();
         ResultWithQueryId<MaterializedResult> queryResult = queryRunner.executeWithQueryId(
-                getSession(),
-                "SELECT * FROM test_parquet_timestamp_predicate_pushdown WHERE t < TIMESTAMP '2012-10-31 01:00'");
+                session,
+                format("SELECT * FROM test_parquet_timestamp_predicate_pushdown WHERE t < TIMESTAMP '%s'", value));
         assertEquals(getQueryInfo(queryRunner, queryResult).getQueryStats().getProcessedInputDataSize().toBytes(), 0);
 
         queryResult = queryRunner.executeWithQueryId(
-                getSession(),
-                "SELECT * FROM test_parquet_timestamp_predicate_pushdown WHERE t > TIMESTAMP '2012-10-31 01:00'");
+                session,
+                format("SELECT * FROM test_parquet_timestamp_predicate_pushdown WHERE t > TIMESTAMP '%s'", value));
         assertEquals(getQueryInfo(queryRunner, queryResult).getQueryStats().getProcessedInputDataSize().toBytes(), 0);
 
-        queryResult = queryRunner.executeWithQueryId(
-                getSession(),
-                "SELECT * FROM test_parquet_timestamp_predicate_pushdown WHERE t = TIMESTAMP '2012-10-31 01:00'");
-        assertThat(getQueryInfo(queryRunner, queryResult).getQueryStats().getProcessedInputDataSize().toBytes()).isGreaterThan(0);
+        // TODO: replace this with a simple query stats check once we find a way to wait until all pending updates to query stats have been applied
+        ExponentialSleeper sleeper = new ExponentialSleeper(
+                new Duration(0, SECONDS),
+                new Duration(5, SECONDS),
+                new Duration(100, MILLISECONDS),
+                2.0);
+        assertEventually(new Duration(30, SECONDS), () -> {
+            ResultWithQueryId<MaterializedResult> result = queryRunner.executeWithQueryId(
+                    session,
+                    format("SELECT * FROM test_parquet_timestamp_predicate_pushdown WHERE t = TIMESTAMP '%s'", value));
+            sleeper.sleep();
+            assertThat(getQueryInfo(queryRunner, result).getQueryStats().getProcessedInputDataSize().toBytes()).isGreaterThan(0);
+        });
     }
 
     private QueryInfo getQueryInfo(DistributedQueryRunner queryRunner, ResultWithQueryId<MaterializedResult> queryResult)
@@ -4319,6 +4402,19 @@ public class TestHiveIntegrationSmokeTest
             assertUpdate("ALTER TABLE evolve_test ADD COLUMN a row(b bigint, c varchar)");
             assertUpdate("INSERT INTO evolve_test values (2, row(2, 'def'), 2)", 1);
             assertQuery("SELECT a.c FROM evolve_test", "SELECT 'def' UNION SELECT null");
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS evolve_test");
+        }
+
+        // Verify field access when the row evolves without changes to field type
+        try {
+            assertUpdate("CREATE TABLE evolve_test (dummy bigint, a row(b bigint, c varchar), d bigint) with (format = '" + format + "', partitioned_by=array['d'])");
+            assertUpdate("INSERT INTO evolve_test values (1, row(1, 'abc'), 1)", 1);
+            assertUpdate("ALTER TABLE evolve_test DROP COLUMN a");
+            assertUpdate("ALTER TABLE evolve_test ADD COLUMN a row(b bigint, c varchar, e int)");
+            assertUpdate("INSERT INTO evolve_test values (2, row(2, 'def', 2), 2)", 1);
+            assertQuery("SELECT a.b FROM evolve_test", "VALUES 1, 2");
         }
         finally {
             assertUpdate("DROP TABLE IF EXISTS evolve_test");
@@ -4545,6 +4641,24 @@ public class TestHiveIntegrationSmokeTest
         assertTrue(computeActual("SELECT foo FROM " + tableName + " WHERE foo = 'b' AND root.foo = 'b'").getMaterializedRows().isEmpty());
 
         assertUpdate("DROP TABLE " + tableName);
+    }
+
+    @Test
+    public void testParquetNaNStatistics()
+    {
+        String tableName = "test_parquet_nan_statistics";
+
+        assertUpdate("CREATE TABLE " + tableName + " (c_double DOUBLE, c_real REAL, c_string VARCHAR) WITH (format = 'PARQUET')");
+        assertUpdate("INSERT INTO " + tableName + " VALUES (nan(), cast(nan() as REAL), 'all nan')", 1);
+        assertUpdate("INSERT INTO " + tableName + " VALUES (nan(), null, 'null real'), (null, nan(), 'null double')", 2);
+        assertUpdate("INSERT INTO " + tableName + " VALUES (nan(), 4.2, '4.2 real'), (4.2, nan(), '4.2 double')", 2);
+        assertUpdate("INSERT INTO " + tableName + " VALUES (0.1, 0.1, 'both 0.1')", 1);
+
+        // These assertions are intended to make sure we are handling NaN values in Parquet statistics,
+        // however Parquet file stats created in Presto don't include such values; the test is here mainly to prevent
+        // regressions, should a new writer start recording such stats
+        assertQuery("SELECT c_string FROM " + tableName + " WHERE c_double > 4", "VALUES ('4.2 double')");
+        assertQuery("SELECT c_string FROM " + tableName + " WHERE c_real > 4", "VALUES ('4.2 real')");
     }
 
     @Test
@@ -5654,6 +5768,26 @@ public class TestHiveIntegrationSmokeTest
         String tableName = "test_analyze_empty_table";
         assertUpdate(format("CREATE TABLE %s (c_bigint BIGINT, c_varchar VARCHAR(2))", tableName));
         assertUpdate("ANALYZE " + tableName, 0);
+    }
+
+    @DataProvider
+    public Object[][] nonDefaultTimestampPrecisions()
+    {
+        return new Object[][] {
+                {HiveTimestampPrecision.MICROSECONDS},
+                {HiveTimestampPrecision.NANOSECONDS}
+        };
+    }
+
+    @Test(dataProvider = "nonDefaultTimestampPrecisions")
+    public void testWriteNonDefaultPrecisionTimestampColumn(HiveTimestampPrecision timestampPrecision)
+    {
+        SqlExecutor sqlExecutor = sql -> getQueryRunner().execute(sql);
+        try (TestTable table = new TestTable(sqlExecutor, "test_analyze_empty_timestamp", "(c_bigint BIGINT, c_timestamp TIMESTAMP)")) {
+            Session session = withTimestampPrecision(getSession(), timestampPrecision.name());
+            assertQueryFails(session, "ANALYZE " + table.getName(), format("\\QCREATE TABLE, INSERT and ANALYZE are not supported with requested timestamp precision: timestamp(%s)\\E", timestampPrecision.getPrecision()));
+            assertQueryFails(session, format("INSERT INTO %s VALUES (1, TIMESTAMP'2001-02-03 11:22:33.123456789')", table.getName()), format("\\QCREATE TABLE, INSERT and ANALYZE are not supported with requested timestamp precision: timestamp(%s)\\E", timestampPrecision.getPrecision()));
+        }
     }
 
     @Test
@@ -6813,6 +6947,33 @@ public class TestHiveIntegrationSmokeTest
     }
 
     @Test
+    public void testSortedWritingTempStaging()
+    {
+        String tableName = "test_sorted_writing";
+        @Language("SQL") String createTableSql = format("" +
+                        "CREATE TABLE %s " +
+                        "WITH (" +
+                        "   bucket_count = 7," +
+                        "   bucketed_by = ARRAY['shipmode']," +
+                        "   sorted_by = ARRAY['shipmode']" +
+                        ") AS " +
+                        "SELECT * FROM tpch.tiny.lineitem",
+                tableName);
+
+        Session session = Session.builder(getSession())
+                .setCatalogSessionProperty("hive", "sorted_writing_enabled", "true")
+                .setCatalogSessionProperty("hive", "temporary_staging_directory_enabled", "true")
+                .setCatalogSessionProperty("hive", "temporary_staging_directory_path", "/tmp/custom/temporary-${USER}")
+                .build();
+
+        assertUpdate(session, createTableSql, 60175L);
+        MaterializedResult expected = computeActual("SELECT * FROM tpch.tiny.lineitem");
+        MaterializedResult actual = computeActual("SELECT * FROM " + tableName);
+        assertEqualsIgnoreOrder(actual.getMaterializedRows(), expected.getMaterializedRows());
+        assertUpdate("DROP TABLE " + tableName);
+    }
+
+    @Test
     public void testSelectWithNoColumns()
     {
         testWithAllStorageFormats(this::testSelectWithNoColumns);
@@ -6929,7 +7090,12 @@ public class TestHiveIntegrationSmokeTest
 
     private void assertOneNotNullResult(@Language("SQL") String query)
     {
-        MaterializedResult results = getQueryRunner().execute(getSession(), query).toTestTypes();
+        assertOneNotNullResult(getSession(), query);
+    }
+
+    private void assertOneNotNullResult(Session session, @Language("SQL") String query)
+    {
+        MaterializedResult results = getQueryRunner().execute(session, query).toTestTypes();
         assertEquals(results.getRowCount(), 1);
         assertEquals(results.getMaterializedRows().get(0).getFieldCount(), 1);
         assertNotNull(results.getMaterializedRows().get(0).getField(0));
@@ -6937,8 +7103,7 @@ public class TestHiveIntegrationSmokeTest
 
     private Type canonicalizeType(Type type)
     {
-        HiveType hiveType = HiveType.toHiveType(typeTranslator, type);
-        return TYPE_MANAGER.getType(hiveType.getTypeSignature());
+        return TYPE_MANAGER.getType(toHiveType(type).getTypeSignature());
     }
 
     private void assertColumnType(TableMetadata tableMetadata, String columnName, Type expectedType)
@@ -7055,5 +7220,56 @@ public class TestHiveIntegrationSmokeTest
             this.type = requireNonNull(type, "type is null");
             this.estimate = requireNonNull(estimate, "estimate is null");
         }
+    }
+
+    private static class ExponentialSleeper
+    {
+        private Duration nextSleepTime;
+        private final Duration maxSleepTime;
+        private final Duration minSleepIncrement;
+        private final double sleepIncrementFactor;
+
+        ExponentialSleeper(Duration minSleepTime, Duration maxSleepTime, Duration minSleepIncrement, double sleepIncrementFactor)
+        {
+            this.nextSleepTime = minSleepTime;
+            this.maxSleepTime = maxSleepTime;
+            this.minSleepIncrement = minSleepIncrement;
+            this.sleepIncrementFactor = sleepIncrementFactor;
+        }
+
+        public void sleep()
+        {
+            try {
+                Thread.sleep(nextSleepTime.toMillis());
+                long incrementMillis = (long) (nextSleepTime.toMillis() * sleepIncrementFactor - nextSleepTime.toMillis());
+                if (incrementMillis < minSleepIncrement.toMillis()) {
+                    incrementMillis = minSleepIncrement.toMillis();
+                }
+                nextSleepTime = new Duration(nextSleepTime.toMillis() + incrementMillis, MILLISECONDS);
+                if (nextSleepTime.compareTo(maxSleepTime) > 0) {
+                    nextSleepTime = maxSleepTime;
+                }
+            }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    @DataProvider
+    public Object[][] timestampPrecision()
+    {
+        return new Object[][] {
+                {HiveTimestampPrecision.MILLISECONDS},
+                {HiveTimestampPrecision.MICROSECONDS},
+                {HiveTimestampPrecision.NANOSECONDS}};
+    }
+
+    private Session withTimestampPrecision(Session session, String precision)
+    {
+        return Session.builder(session)
+                .setCatalogSessionProperty(catalog, "timestamp_precision", precision)
+                .build();
     }
 }

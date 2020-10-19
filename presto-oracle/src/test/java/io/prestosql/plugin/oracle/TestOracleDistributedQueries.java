@@ -13,6 +13,7 @@
  */
 package io.prestosql.plugin.oracle;
 
+import com.google.common.collect.ImmutableMap;
 import io.prestosql.Session;
 import io.prestosql.execution.QueryInfo;
 import io.prestosql.testing.AbstractTestDistributedQueries;
@@ -20,6 +21,7 @@ import io.prestosql.testing.DistributedQueryRunner;
 import io.prestosql.testing.MaterializedResult;
 import io.prestosql.testing.QueryRunner;
 import io.prestosql.testing.ResultWithQueryId;
+import io.prestosql.testing.sql.SqlExecutor;
 import io.prestosql.testing.sql.TestTable;
 import io.prestosql.tpch.TpchTable;
 import org.testng.annotations.AfterClass;
@@ -27,13 +29,10 @@ import org.testng.annotations.Test;
 
 import java.util.Optional;
 
-import static io.prestosql.plugin.oracle.TestingOracleServer.TEST_SCHEMA;
 import static io.prestosql.spi.type.VarcharType.VARCHAR;
 import static io.prestosql.testing.MaterializedResult.resultBuilder;
 import static io.prestosql.testing.sql.TestTable.randomTableSuffix;
 import static java.lang.String.format;
-import static java.util.stream.Collectors.joining;
-import static java.util.stream.IntStream.range;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
@@ -48,9 +47,7 @@ public class TestOracleDistributedQueries
             throws Exception
     {
         this.oracleServer = new TestingOracleServer();
-        return OracleQueryRunner.createOracleQueryRunner(
-                oracleServer,
-                TpchTable.getTables());
+        return OracleQueryRunner.createOracleQueryRunner(oracleServer, ImmutableMap.of(), TpchTable.getTables(), false);
     }
 
     @AfterClass(alwaysRun = true)
@@ -59,6 +56,12 @@ public class TestOracleDistributedQueries
         if (oracleServer != null) {
             oracleServer.close();
         }
+    }
+
+    @Override
+    protected boolean supportsDelete()
+    {
+        return false;
     }
 
     @Override
@@ -74,21 +77,22 @@ public class TestOracleDistributedQueries
     }
 
     @Override
-    public void testCommentTable()
+    protected boolean supportsCommentOnTable()
     {
-        // table comment not supported
+        return false;
     }
 
     @Override
-    public void testDelete()
+    protected boolean supportsCommentOnColumn()
     {
-        // delete is not supported
+        return false;
     }
 
     @Override
     public void testCreateSchema()
     {
         // schema creation is not supported
+        assertQueryFails("CREATE SCHEMA test_schema_create", "This connector does not support creating schemas");
     }
 
     @Override
@@ -115,34 +119,13 @@ public class TestOracleDistributedQueries
     protected TestTable createTableWithDefaultColumns()
     {
         return new TestTable(
-                oracleServer::execute,
-                format("%s.table", TEST_SCHEMA),
+                createJdbcSqlExecutor(),
+                "test_default_columns",
                 "(col_required decimal(20,0) NOT NULL," +
                         "col_nullable decimal(20,0)," +
                         "col_default decimal(20,0) DEFAULT 43," +
                         "col_nonnull_default decimal(20,0) DEFAULT 42 NOT NULL ," +
                         "col_required2 decimal(20,0) NOT NULL)");
-    }
-
-    @Test
-    @Override
-    public void testLargeIn()
-    {
-        int numberOfElements = 1000;
-        String longValues = range(0, numberOfElements)
-                .mapToObj(Integer::toString)
-                .collect(joining(", "));
-        assertQuery("SELECT orderkey FROM orders WHERE orderkey IN (" + longValues + ")");
-        assertQuery("SELECT orderkey FROM orders WHERE orderkey NOT IN (" + longValues + ")");
-
-        assertQuery("SELECT orderkey FROM orders WHERE orderkey IN (mod(1000, orderkey), " + longValues + ")");
-        assertQuery("SELECT orderkey FROM orders WHERE orderkey NOT IN (mod(1000, orderkey), " + longValues + ")");
-
-        String arrayValues = range(0, numberOfElements)
-                .mapToObj(i -> format("ARRAY[%s, %s, %s]", i, i + 1, i + 2))
-                .collect(joining(", "));
-        assertQuery("SELECT ARRAY[0, 0, 0] in (ARRAY[0, 0, 0], " + arrayValues + ")", "values true");
-        assertQuery("SELECT ARRAY[0, 0, 0] in (" + arrayValues + ")", "values false");
     }
 
     @Test
@@ -409,8 +392,14 @@ public class TestOracleDistributedQueries
     }
 
     @Override
-    public void testColumnName(String columnName)
+    protected Optional<String> filterColumnNameTestData(String columnName)
     {
         // table names generated has more than 30chars, max size naming on oracle.
+        return Optional.empty();
+    }
+
+    protected SqlExecutor createJdbcSqlExecutor()
+    {
+        return oracleServer::execute;
     }
 }

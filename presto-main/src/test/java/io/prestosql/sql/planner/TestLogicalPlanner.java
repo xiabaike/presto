@@ -19,8 +19,8 @@ import io.airlift.slice.Slices;
 import io.prestosql.Session;
 import io.prestosql.plugin.tpch.TpchColumnHandle;
 import io.prestosql.plugin.tpch.TpchTableHandle;
-import io.prestosql.spi.block.SortOrder;
 import io.prestosql.spi.connector.ColumnHandle;
+import io.prestosql.spi.connector.SortOrder;
 import io.prestosql.spi.predicate.Domain;
 import io.prestosql.spi.predicate.Range;
 import io.prestosql.spi.predicate.TupleDomain;
@@ -40,6 +40,7 @@ import io.prestosql.sql.planner.plan.CorrelatedJoinNode;
 import io.prestosql.sql.planner.plan.DistinctLimitNode;
 import io.prestosql.sql.planner.plan.EnforceSingleRowNode;
 import io.prestosql.sql.planner.plan.ExchangeNode;
+import io.prestosql.sql.planner.plan.ExplainAnalyzeNode;
 import io.prestosql.sql.planner.plan.FilterNode;
 import io.prestosql.sql.planner.plan.IndexJoinNode;
 import io.prestosql.sql.planner.plan.JoinNode;
@@ -48,6 +49,7 @@ import io.prestosql.sql.planner.plan.MarkDistinctNode;
 import io.prestosql.sql.planner.plan.PlanNode;
 import io.prestosql.sql.planner.plan.ProjectNode;
 import io.prestosql.sql.planner.plan.SemiJoinNode;
+import io.prestosql.sql.planner.plan.SemiJoinNode.DistributionType;
 import io.prestosql.sql.planner.plan.SortNode;
 import io.prestosql.sql.planner.plan.StatisticsWriterNode;
 import io.prestosql.sql.planner.plan.TableScanNode;
@@ -276,6 +278,19 @@ public class TestLogicalPlanner
     }
 
     @Test
+    public void testTrivialFilterOverDuplicateSymbol()
+    {
+        assertPlan(
+                "WITH t AS (SELECT DISTINCT cast(null AS varchar), cast(null AS varchar)) " +
+                        "SELECT * FROM t WHERE 1 = 0",
+                output(ImmutableList.of("expr", "expr"), values("expr")));
+
+        assertPlan(
+                "SELECT * FROM (SELECT DISTINCT 1, 1) WHERE 1 = 0",
+                output(ImmutableList.of("expr", "expr"), values("expr")));
+    }
+
+    @Test
     public void testDistinctLimitOverInequalityJoin()
     {
         assertPlan("SELECT DISTINCT o.orderkey FROM orders o JOIN lineitem l ON o.orderkey < l.orderkey LIMIT 1",
@@ -469,15 +484,24 @@ public class TestLogicalPlanner
         // three subqueries with two duplicates (coerced to two different types), only two scalar joins should be in plan
         assertEquals(
                 countOfMatchingNodes(
-                        plan("SELECT * FROM orders WHERE CAST(orderkey AS INTEGER) = (SELECT 1) AND custkey = (SELECT 2) AND CAST(custkey as REAL) != (SELECT 1)"),
-                        ValuesNode.class::isInstance),
-                2);
+                        plan("SELECT * " +
+                                "FROM orders " +
+                                "WHERE CAST(orderkey AS INTEGER) = (SELECT 1 FROM orders LIMIT 1) " +
+                                "AND custkey = (SELECT 2 FROM orders LIMIT 1) " +
+                                "AND CAST(custkey as REAL) != (SELECT 1 FROM orders LIMIT 1)"),
+                        TableScanNode.class::isInstance),
+                3);
         // same query used for left, right and complex join condition
         assertEquals(
                 countOfMatchingNodes(
-                        plan("SELECT * FROM orders o1 JOIN orders o2 ON o1.orderkey = (SELECT 1) AND o2.orderkey = (SELECT 1) AND o1.orderkey + o2.orderkey > (SELECT 1)"),
-                        ValuesNode.class::isInstance),
-                1);
+                        plan("SELECT * " +
+                                "FROM orders o1 " +
+                                "JOIN orders o2 ON " +
+                                "  o1.orderkey = (SELECT 1 FROM orders LIMIT 1) " +
+                                "  AND o2.orderkey = (SELECT 1 FROM orders LIMIT 1) " +
+                                "  AND o1.orderkey + o2.orderkey > (SELECT 1 FROM orders LIMIT 1)"),
+                        TableScanNode.class::isInstance),
+                3);
     }
 
     @Test
@@ -514,6 +538,33 @@ public class TestLogicalPlanner
                         plan("SELECT 1 <= ALL(SELECT 1), 2 <= ALL(SELECT 1) WHERE 1 <= ALL(SELECT 1)"),
                         AggregationNode.class::isInstance),
                 2);
+    }
+
+    @Test
+    public void testSameExistsAppliedOnlyOnce()
+    {
+        assertPlan(
+                "SELECT EXISTS (SELECT 1 FROM orders), EXISTS (SELECT 1 FROM orders)",
+                anyTree(
+                        node(AggregationNode.class,
+                                tableScan("orders"))));
+    }
+
+    @Test
+    public void testReferenceToSameFieldAppliedOnlyOnce()
+    {
+        assertEquals(
+                countOfMatchingNodes(
+                        plan(
+                                "SELECT " +
+                                        "(SELECT 1 FROM orders WHERE orderkey = x) + " +
+                                        "(SELECT 1 FROM orders WHERE orderkey = t.x) + " +
+                                        "(SELECT 1 FROM orders WHERE orderkey = T.x) + " +
+                                        "(SELECT 1 FROM orders WHERE orderkey = t.X) + " +
+                                        "(SELECT 1 FROM orders WHERE orderkey = T.X)" +
+                                        "FROM (VALUES 1, 2) t(x)"),
+                        JoinNode.class::isInstance),
+                1);
     }
 
     private static int countOfMatchingNodes(Plan plan, Predicate<PlanNode> predicate)
@@ -659,13 +710,14 @@ public class TestLogicalPlanner
                 noJoinReordering(),
                 anyTree(
                         filter(format("CASE \"is_distinct\" WHEN true THEN true ELSE CAST(fail(%s, 'Scalar sub-query has returned multiple rows') AS boolean) END", SUBQUERY_MULTIPLE_ROWS.toErrorCode().getCode()),
-                                markDistinct("is_distinct", ImmutableList.of("unique"),
-                                        join(LEFT, ImmutableList.of(equiJoinClause("n_regionkey", "r_regionkey")),
-                                                assignUniqueId("unique",
-                                                        exchange(REMOTE, REPARTITION,
-                                                                anyTree(tableScan("nation", ImmutableMap.of("n_regionkey", "regionkey"))))),
-                                                anyTree(
-                                                        tableScan("region", ImmutableMap.of("r_regionkey", "regionkey"))))))));
+                                project(
+                                        markDistinct("is_distinct", ImmutableList.of("unique"),
+                                                join(LEFT, ImmutableList.of(equiJoinClause("n_regionkey", "r_regionkey")),
+                                                        assignUniqueId("unique",
+                                                                exchange(REMOTE, REPARTITION,
+                                                                        anyTree(tableScan("nation", ImmutableMap.of("n_regionkey", "regionkey"))))),
+                                                        anyTree(
+                                                                tableScan("region", ImmutableMap.of("r_regionkey", "regionkey")))))))));
     }
 
     @Test
@@ -808,16 +860,17 @@ public class TestLogicalPlanner
                 OPTIMIZED,
                 anyTree(
                         filter("OUTER_FILTER",
-                                apply(ImmutableList.of("C", "O"),
-                                        ImmutableMap.of("OUTER_FILTER", expression("THREE IN (C)")),
-                                        project(ImmutableMap.of("THREE", expression("BIGINT '3'")),
-                                                tableScan("orders", ImmutableMap.of(
-                                                        "O", "orderkey",
-                                                        "C", "custkey"))),
-                                        project(
-                                                any(
+                                project(
+                                        apply(ImmutableList.of("O", "C"),
+                                                ImmutableMap.of("OUTER_FILTER", expression("THREE IN (C)")),
+                                                project(ImmutableMap.of("THREE", expression("BIGINT '3'")),
+                                                        tableScan("orders", ImmutableMap.of(
+                                                                "O", "orderkey",
+                                                                "C", "custkey"))),
+                                                project(
                                                         any(
-                                                                tableScan("lineitem", ImmutableMap.of("L", "orderkey")))))))),
+                                                                any(
+                                                                        tableScan("lineitem", ImmutableMap.of("L", "orderkey"))))))))),
                 MorePredicates.<PlanOptimizer>isInstanceOfAny(AddLocalExchanges.class, CheckSubqueryNodesAreRewritten.class).negate());
     }
 
@@ -828,12 +881,13 @@ public class TestLogicalPlanner
                 "SELECT orderkey FROM orders WHERE EXISTS(SELECT 1 WHERE orderkey = 3)", // EXISTS maps to count(*) > 0
                 anyTree(
                         filter("FINAL_COUNT > BIGINT '0'",
-                                aggregation(ImmutableMap.of("FINAL_COUNT", functionCall("count", ImmutableList.of("NON_NULL"))),
-                                        join(LEFT, ImmutableList.of(), Optional.of("BIGINT '3' = ORDERKEY"),
-                                                any(
-                                                        tableScan("orders", ImmutableMap.of("ORDERKEY", "orderkey"))),
-                                                project(ImmutableMap.of("NON_NULL", expression("true")),
-                                                        node(ValuesNode.class)))))));
+                                project(
+                                        aggregation(ImmutableMap.of("FINAL_COUNT", functionCall("count", ImmutableList.of("NON_NULL"))),
+                                                join(LEFT, ImmutableList.of(), Optional.of("BIGINT '3' = ORDERKEY"),
+                                                        any(
+                                                                tableScan("orders", ImmutableMap.of("ORDERKEY", "orderkey"))),
+                                                        project(ImmutableMap.of("NON_NULL", expression("true")),
+                                                                node(ValuesNode.class))))))));
     }
 
     @Test
@@ -1424,11 +1478,81 @@ public class TestLogicalPlanner
                                                                                 tableScan("orders"))))))))));
     }
 
+    @Test
+    public void testSizeBasedJoin()
+    {
+        // both local.sf100000.nation and local.sf100000.orders don't provide stats, therefore no reordering happens
+        assertDistributedPlan("SELECT custkey FROM local.\"sf42.5\".nation, local.\"sf42.5\".orders WHERE nation.nationkey = orders.custkey",
+                automaticJoinDistribution(),
+                output(
+                        anyTree(
+                                join(INNER, ImmutableList.of(equiJoinClause("NATIONKEY", "CUSTKEY")),
+                                        anyTree(
+                                                tableScan("nation", ImmutableMap.of("NATIONKEY", "nationkey"))),
+                                        anyTree(
+                                                tableScan("orders", ImmutableMap.of("CUSTKEY", "custkey")))))));
+
+        // values node provides stats
+        assertDistributedPlan("SELECT custkey FROM (VALUES CAST(1 AS BIGINT), CAST(2 AS BIGINT)) t(a), local.\"sf42.5\".orders WHERE t.a = orders.custkey",
+                automaticJoinDistribution(),
+                output(
+                        anyTree(
+                                join(INNER, ImmutableList.of(equiJoinClause("CUSTKEY", "T_A")), Optional.empty(), Optional.of(REPLICATED),
+                                        anyTree(
+                                                tableScan("orders", ImmutableMap.of("CUSTKEY", "custkey"))),
+                                        anyTree(
+                                                values("T_A"))))));
+    }
+
+    @Test
+    public void testSizeBasedSemiJoin()
+    {
+        // both local.sf100000.nation and local.sf100000.orders don't provide stats, therefore no reordering happens
+        assertDistributedPlan("SELECT custkey FROM local.\"sf42.5\".orders WHERE orders.custkey IN (SELECT nationkey FROM local.\"sf42.5\".nation)",
+                automaticJoinDistribution(),
+                output(
+                        anyTree(
+                                semiJoin("CUSTKEY", "NATIONKEY", "OUT", Optional.of(DistributionType.PARTITIONED),
+                                        anyTree(
+                                                tableScan("orders", ImmutableMap.of("CUSTKEY", "custkey"))),
+                                        anyTree(
+                                                tableScan("nation", ImmutableMap.of("NATIONKEY", "nationkey")))))));
+
+        // values node provides stats
+        assertDistributedPlan("SELECT custkey FROM local.\"sf42.5\".orders WHERE orders.custkey IN (SELECT t.a FROM (VALUES CAST(1 AS BIGINT), CAST(2 AS BIGINT)) t(a))",
+                automaticJoinDistribution(),
+                output(
+                        anyTree(
+                                semiJoin("CUSTKEY", "T_A", "OUT", Optional.of(DistributionType.REPLICATED),
+                                        anyTree(
+                                                tableScan("orders", ImmutableMap.of("CUSTKEY", "custkey"))),
+                                        anyTree(
+                                                values("T_A"))))));
+    }
+
+    @Test
+    public void testExplainAnalyze()
+    {
+        assertPlan("EXPLAIN ANALYZE SELECT regionkey FROM nation",
+                output(
+                        node(ExplainAnalyzeNode.class,
+                                exchange(LOCAL, GATHER,
+                                        strictTableScan("nation", ImmutableMap.of("regionkey", "regionkey"))))));
+    }
+
     private Session noJoinReordering()
     {
         return Session.builder(getQueryRunner().getDefaultSession())
                 .setSystemProperty(JOIN_REORDERING_STRATEGY, JoinReorderingStrategy.NONE.name())
-                .setSystemProperty(JOIN_DISTRIBUTION_TYPE, JoinNode.DistributionType.PARTITIONED.name())
+                .setSystemProperty(JOIN_DISTRIBUTION_TYPE, JoinDistributionType.PARTITIONED.name())
+                .build();
+    }
+
+    private Session automaticJoinDistribution()
+    {
+        return Session.builder(getQueryRunner().getDefaultSession())
+                .setSystemProperty(JOIN_REORDERING_STRATEGY, JoinReorderingStrategy.NONE.name())
+                .setSystemProperty(JOIN_DISTRIBUTION_TYPE, JoinDistributionType.AUTOMATIC.name())
                 .build();
     }
 }

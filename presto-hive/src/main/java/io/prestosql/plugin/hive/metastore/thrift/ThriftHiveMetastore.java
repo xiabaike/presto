@@ -39,6 +39,7 @@ import io.prestosql.plugin.hive.metastore.Column;
 import io.prestosql.plugin.hive.metastore.HiveColumnStatistics;
 import io.prestosql.plugin.hive.metastore.HivePrincipal;
 import io.prestosql.plugin.hive.metastore.HivePrivilegeInfo;
+import io.prestosql.plugin.hive.metastore.MetastoreConfig;
 import io.prestosql.plugin.hive.metastore.PartitionWithStatistics;
 import io.prestosql.plugin.hive.metastore.thrift.ThriftMetastoreAuthenticationConfig.ThriftMetastoreAuthenticationType;
 import io.prestosql.plugin.hive.util.RetryDriver;
@@ -46,6 +47,7 @@ import io.prestosql.spi.PrestoException;
 import io.prestosql.spi.connector.SchemaNotFoundException;
 import io.prestosql.spi.connector.SchemaTableName;
 import io.prestosql.spi.connector.TableNotFoundException;
+import io.prestosql.spi.predicate.TupleDomain;
 import io.prestosql.spi.security.ConnectorIdentity;
 import io.prestosql.spi.security.RoleGrant;
 import io.prestosql.spi.statistics.ColumnStatisticType;
@@ -120,8 +122,10 @@ import static com.google.common.collect.Iterables.getOnlyElement;
 import static com.google.common.collect.Sets.difference;
 import static io.prestosql.plugin.hive.HiveErrorCode.HIVE_METASTORE_ERROR;
 import static io.prestosql.plugin.hive.HiveErrorCode.HIVE_TABLE_LOCK_NOT_ACQUIRED;
+import static io.prestosql.plugin.hive.ViewReaderUtil.PRESTO_VIEW_FLAG;
 import static io.prestosql.plugin.hive.metastore.HivePrivilegeInfo.HivePrivilege;
 import static io.prestosql.plugin.hive.metastore.HivePrivilegeInfo.HivePrivilege.OWNERSHIP;
+import static io.prestosql.plugin.hive.metastore.MetastoreUtil.partitionKeyFilterToStringList;
 import static io.prestosql.plugin.hive.metastore.thrift.ThriftMetastoreUtil.createMetastoreColumnStatistics;
 import static io.prestosql.plugin.hive.metastore.thrift.ThriftMetastoreUtil.fromMetastoreApiPrincipalType;
 import static io.prestosql.plugin.hive.metastore.thrift.ThriftMetastoreUtil.fromMetastoreApiTable;
@@ -132,7 +136,6 @@ import static io.prestosql.plugin.hive.metastore.thrift.ThriftMetastoreUtil.isAv
 import static io.prestosql.plugin.hive.metastore.thrift.ThriftMetastoreUtil.parsePrivilege;
 import static io.prestosql.plugin.hive.metastore.thrift.ThriftMetastoreUtil.toMetastoreApiPartition;
 import static io.prestosql.plugin.hive.metastore.thrift.ThriftMetastoreUtil.updateStatisticsParameters;
-import static io.prestosql.plugin.hive.util.HiveUtil.PRESTO_VIEW_FLAG;
 import static io.prestosql.spi.StandardErrorCode.ALREADY_EXISTS;
 import static io.prestosql.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.prestosql.spi.security.PrincipalType.USER;
@@ -183,19 +186,33 @@ public class ThriftHiveMetastore
 
     private static final Pattern TABLE_PARAMETER_SAFE_KEY_PATTERN = Pattern.compile("^[a-zA-Z_]+$");
     private static final Pattern TABLE_PARAMETER_SAFE_VALUE_PATTERN = Pattern.compile("^[a-zA-Z0-9]*$");
+    private final boolean assumeCanonicalPartitionKeys;
 
     @Inject
-    public ThriftHiveMetastore(MetastoreLocator metastoreLocator, HiveConfig hiveConfig, ThriftMetastoreConfig thriftConfig, ThriftMetastoreAuthenticationConfig authenticationConfig, HdfsEnvironment hdfsEnvironment)
+    public ThriftHiveMetastore(
+            MetastoreLocator metastoreLocator,
+            HiveConfig hiveConfig,
+            MetastoreConfig metastoreConfig,
+            ThriftMetastoreConfig thriftConfig,
+            ThriftMetastoreAuthenticationConfig authenticationConfig,
+            HdfsEnvironment hdfsEnvironment)
     {
         this(
                 metastoreLocator,
                 hiveConfig,
+                metastoreConfig,
                 thriftConfig,
                 hdfsEnvironment,
                 authenticationConfig.getAuthenticationType() != ThriftMetastoreAuthenticationType.NONE);
     }
 
-    public ThriftHiveMetastore(MetastoreLocator metastoreLocator, HiveConfig hiveConfig, ThriftMetastoreConfig thriftConfig, HdfsEnvironment hdfsEnvironment, boolean authenticationEnabled)
+    public ThriftHiveMetastore(
+            MetastoreLocator metastoreLocator,
+            HiveConfig hiveConfig,
+            MetastoreConfig metastoreConfig,
+            ThriftMetastoreConfig thriftConfig,
+            HdfsEnvironment hdfsEnvironment,
+            boolean authenticationEnabled)
     {
         this.hdfsContext = new HdfsContext(ConnectorIdentity.ofUser(DEFAULT_METASTORE_USER));
         this.clientProvider = requireNonNull(metastoreLocator, "metastoreLocator is null");
@@ -207,7 +224,10 @@ public class ThriftHiveMetastore
         this.maxRetries = thriftConfig.getMaxRetries();
         this.impersonationEnabled = thriftConfig.isImpersonationEnabled();
         this.deleteFilesOnDrop = thriftConfig.isDeleteFilesOnDrop();
+        requireNonNull(hiveConfig, "hiveConfig is null");
         this.translateHiveViews = hiveConfig.isTranslateHiveViews();
+        requireNonNull(metastoreConfig, "metastoreConfig is null");
+        checkArgument(!metastoreConfig.isHideDeltaLakeTables(), "Hiding Delta Lake tables is not supported"); // TODO
         this.maxWaitForLock = thriftConfig.getMaxWaitForTransactionLock();
         this.authenticationEnabled = authenticationEnabled;
 
@@ -215,6 +235,7 @@ public class ThriftHiveMetastore
                 .expireAfterWrite(thriftConfig.getDelegationTokenCacheTtl().toMillis(), MILLISECONDS)
                 .maximumSize(thriftConfig.getDelegationTokenCacheMaximumSize())
                 .build(CacheLoader.from(this::loadDelegationToken));
+        this.assumeCanonicalPartitionKeys = thriftConfig.isAssumeCanonicalPartitionKeys();
     }
 
     @Managed
@@ -322,9 +343,6 @@ public class ThriftHiveMetastore
                     .stopOnIllegalExceptions()
                     .run("getTable", stats.getGetTable().wrap(() -> {
                         Table table = getTableFromMetastore(identity, databaseName, tableName);
-                        if (!translateHiveViews && table.getTableType().equals(TableType.VIRTUAL_VIEW.name()) && !isPrestoView(table)) {
-                            throw new HiveViewNotSupportedException(new SchemaTableName(databaseName, tableName));
-                        }
                         return Optional.of(table);
                     }));
         }
@@ -354,11 +372,6 @@ public class ThriftHiveMetastore
     public Set<ColumnStatisticType> getSupportedColumnStatistics(Type type)
     {
         return ThriftMetastoreUtil.getSupportedColumnStatistics(type);
-    }
-
-    private static boolean isPrestoView(Table table)
-    {
-        return "true".equals(table.getParameters().get(PRESTO_VIEW_FLAG));
     }
 
     @Override
@@ -1141,39 +1154,31 @@ public class ThriftHiveMetastore
     }
 
     @Override
-    public Optional<List<String>> getPartitionNames(HiveIdentity identity, String databaseName, String tableName)
+    public Optional<List<String>> getPartitionNamesByFilter(HiveIdentity identity, String databaseName, String tableName, List<String> columnNames, TupleDomain<String> partitionKeysFilter)
     {
-        try {
-            return retry()
-                    .stopOn(NoSuchObjectException.class)
-                    .stopOnIllegalExceptions()
-                    .run("getPartitionNames", stats.getGetPartitionNames().wrap(() -> {
-                        try (ThriftMetastoreClient client = createMetastoreClient(identity)) {
-                            return Optional.of(client.getPartitionNames(databaseName, tableName));
-                        }
-                    }));
+        Optional<List<String>> parts = partitionKeyFilterToStringList(columnNames, partitionKeysFilter, assumeCanonicalPartitionKeys);
+        checkArgument(!columnNames.isEmpty() || partitionKeysFilter.isAll(), "must pass in all columnNames or the filter must be all");
+        if (parts.isEmpty()) {
+            return Optional.of(ImmutableList.of());
         }
-        catch (NoSuchObjectException e) {
-            return Optional.empty();
-        }
-        catch (TException e) {
-            throw new PrestoException(HIVE_METASTORE_ERROR, e);
-        }
-        catch (Exception e) {
-            throw propagate(e);
-        }
-    }
 
-    @Override
-    public Optional<List<String>> getPartitionNamesByParts(HiveIdentity identity, String databaseName, String tableName, List<String> parts)
-    {
         try {
+            if (partitionKeysFilter.isAll()) {
+                return retry()
+                        .stopOn(NoSuchObjectException.class)
+                        .stopOnIllegalExceptions()
+                        .run("getPartitionNames", stats.getGetPartitionNames().wrap(() -> {
+                            try (ThriftMetastoreClient client = createMetastoreClient(identity)) {
+                                return Optional.of(client.getPartitionNames(databaseName, tableName));
+                            }
+                        }));
+            }
             return retry()
                     .stopOn(NoSuchObjectException.class)
                     .stopOnIllegalExceptions()
                     .run("getPartitionNamesByParts", stats.getGetPartitionNamesByParts().wrap(() -> {
                         try (ThriftMetastoreClient client = createMetastoreClient(identity)) {
-                            return Optional.of(client.getPartitionNamesFiltered(databaseName, tableName, parts));
+                            return Optional.of(client.getPartitionNamesFiltered(databaseName, tableName, parts.get()));
                         }
                     }));
         }
@@ -1745,7 +1750,8 @@ public class ThriftHiveMetastore
                             new HiveObjectRef(TABLE, databaseName, tableName, null, null),
                             grantee.getName(),
                             fromPrestoPrincipalType(grantee.getType()),
-                            privilegeGrantInfo));
+                            privilegeGrantInfo,
+                            "SQL"));
         }
         return new PrivilegeBag(privilegeBagBuilder.build());
     }
@@ -1802,7 +1808,7 @@ public class ThriftHiveMetastore
         throw propagate(firstException);
     }
 
-    // TODO instead of whitelisting exceptions we propagate we should recognize exceptions which we suppress and try different alternative call
+    // TODO we should recognize exceptions which we suppress and try different alternative call
     // this requires product tests with HDP 3
     private static boolean defaultIsValidExceptionalResponse(Exception exception)
     {

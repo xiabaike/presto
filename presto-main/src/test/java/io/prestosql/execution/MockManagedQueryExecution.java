@@ -39,6 +39,7 @@ import static io.prestosql.execution.QueryState.FAILED;
 import static io.prestosql.execution.QueryState.FINISHED;
 import static io.prestosql.execution.QueryState.QUEUED;
 import static io.prestosql.execution.QueryState.RUNNING;
+import static io.prestosql.server.DynamicFilterService.DynamicFiltersStats;
 import static io.prestosql.testing.TestingSession.testSessionBuilder;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -130,6 +131,7 @@ public class MockManagedQueryExecution
                         9,
                         DataSize.ofBytes(14),
                         15,
+                        DataSize.ofBytes(13),
                         16.0,
                         memoryUsage,
                         memoryUsage,
@@ -141,7 +143,8 @@ public class MockManagedQueryExecution
                         ImmutableSet.of(),
                         OptionalDouble.empty()),
                 null,
-                null);
+                null,
+                Optional.empty());
     }
 
     @Override
@@ -220,6 +223,7 @@ public class MockManagedQueryExecution
                         DataSize.ofBytes(31),
 
                         ImmutableList.of(),
+                        DynamicFiltersStats.EMPTY,
                         ImmutableList.of()),
                 Optional.empty(),
                 Optional.empty(),
@@ -241,6 +245,7 @@ public class MockManagedQueryExecution
                 ImmutableList.of(),
                 ImmutableList.of(),
                 state.isDone(),
+                Optional.empty(),
                 Optional.empty());
     }
 
